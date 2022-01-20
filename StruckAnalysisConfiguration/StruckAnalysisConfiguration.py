@@ -224,7 +224,14 @@ class StruckAnalysisConfiguration:
       # The input file needs two columns: 'Parameter' and 'Value'
       # We will end up with a dict called run_parameters
 
-      temp_dataframe = pd.read_csv( input_file, delimiter=',' )
+
+      if input_file.split('.')[-1] == 'csv':
+          temp_dataframe = pd.read_csv( input_file, delimiter=',' )
+      elif sheet is not None:
+          if len(sheet)>31:
+              sheet = sheet[:31]
+          temp_dataframe = pd.read_excel( input_file, sheet_name = sheet)
+
       self.run_parameters = dict(zip(temp_dataframe['Parameter'],temp_dataframe['Value']))
 
 

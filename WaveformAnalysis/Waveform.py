@@ -19,8 +19,7 @@ import scipy.optimize as opt
 from scipy.ndimage import gaussian_filter
 from numba import jit
 import copy
-
-
+import matplotlib.pyplot as plt
 
 class Waveform:
 
@@ -218,7 +217,10 @@ class Waveform:
 				if self.store_processed_wfm:
 					self.processed_wfm = corrected_wfm
 				charge_energy = np.mean( corrected_wfm[-int(5000./self.sampling_period_ns):] )
-					# ^Charge energy calculated from the last 5us of the smoothed, corrected wfm 
+				#plt.plot(corrected_wfm)
+				#plt.show()
+				baseline_rms *= self.calibration_constant
+				# ^Charge energy calculated from the last 5us of the smoothed, corrected wfm
 				t10 = -1.
 				t25 = -1.
 				t50 = -1.
@@ -384,4 +386,247 @@ def DecayTimeCorrection( input_wfm, decay_time_us, sampling_period_ns ):
 			new_wfm[i+1] = new_wfm[i] - \
 					np.exp( - (sampling_period_ns/1.e3) / decay_time_us ) * input_wfm[i] + \
 					input_wfm[i+1]
-		return new_wfm 
+		return new_wfm
+
+
+
+class Event:
+
+	def __init__( self, reduced, path_to_tier1, event_number,\
+			run_parameters_file,\
+			calibrations_file,\
+			channel_map_file):
+
+		from TMSAnalysis.StruckAnalysisConfiguration import StruckAnalysisConfiguration
+		import uproot
+
+		try :
+			if path_to_tier1[-1] is not '/':
+				path_to_tier1 += '/'
+		except TypeError:
+			pass
+
+		analysis_config = StruckAnalysisConfiguration.StruckAnalysisConfiguration()
+		analysis_config.GetRunParametersFromFile( run_parameters_file, path_to_tier1.split('/')[-3] )
+		analysis_config.GetCalibrationConstantsFromFile( calibrations_file )
+		analysis_config.GetChannelMapFromFile( channel_map_file, path_to_tier1.split('/')[-3] )
+		channel_number = analysis_config.GetNumberOfChannels()
+		self.event_number 		= event_number
+		self.waveform 			= {}
+		self.baseline			= []
+		self.charge_energy_ch		= []
+		self.risetime 			= []
+		self.sampling_frequency = analysis_config.run_parameters['Sampling Rate [MHz]']
+
+		if path_to_tier1 is not None:
+			path_to_file 		= path_to_tier1
+			try:
+				entry_from_reduced 	= pd.read_hdf(reduced, start=self.event_number, stop=self.event_number+1)
+				timestamp 		= entry_from_reduced['Timestamp'].values[0]
+				fname 			= entry_from_reduced['File'].values[0]
+				self.tot_charge_energy 	= entry_from_reduced['TotalTileEnergy'].values[0]
+				self.event_number 	= entry_from_reduced['Event'][event_number]
+			except OSError:
+				entry_from_reduced = pd.read_pickle(reduced).iloc[self.event_number]
+				timestamp 		= entry_from_reduced['Timestamp']
+				fname 			= entry_from_reduced['File']
+				self.tot_charge_energy 	= entry_from_reduced['TotalTileEnergy']
+				self.event_number 	= entry_from_reduced['Event']
+
+		else:
+			print('No reduced file found, charge energy and risetime information not present')
+			fname = reduced.split('/')[-1]
+			path_to_file = reduced[:-len(fname)]
+			self.tot_charge_energy = 0.0
+
+		tier1_tree = uproot.open('{}{}'.format(path_to_file,fname))['HitTree']
+		tier1_ev = tier1_tree.arrays( entrystart=self.event_number*channel_number, entrystop=(self.event_number+1)*channel_number)
+		#the events picked from the reduced file and from the tier1 root file are cross-checked with their timestamp
+		try:
+			if not np.array_equal(np.unique(tier1_ev[ b'_rawclock']),np.unique(timestamp)):
+				raise RuntimeError('Timestamps not matching')
+
+		except NameError:
+			pass
+
+		global software_channel 
+		software_channel = tier1_ev[b'_slot']*16+tier1_ev[b'_channel']
+		if analysis_config.run_parameters['Sampling Rate [MHz]'] == 62.5:
+			polarity = 1.
+
+		waveform = np.array(tier1_ev[ b'_waveform'])
+		self.ix_channel = []
+		#looping through channels and fill the waveforms
+		for i,ch_waveform in enumerate(waveform):
+			ch_type = analysis_config.GetChannelTypeForSoftwareChannel(software_channel[i])
+			ch_name = analysis_config.GetChannelNameForSoftwareChannel(software_channel[i])
+			if ch_name == 'Off':
+				continue
+			self.ix_channel.append(software_channel[i])
+			self.waveform[ch_name] = Waveform(input_data = ch_waveform,\
+							detector_type       = ch_type,\
+							sampling_period_ns  = 1.e3/self.sampling_frequency,\
+							input_baseline      = -1,\
+							polarity            = polarity,\
+							fixed_trigger       = False,\
+							trigger_position    = analysis_config.run_parameters['Pretrigger Length [samples]'],\
+							decay_time_us       = analysis_config.GetDecayTimeForSoftwareChannel( software_channel[i] ),\
+							calibration_constant = analysis_config.GetCalibrationConstantForSoftwareChannel(software_channel[i]))
+			#same as for Waveform class
+			self.baseline.append(np.mean(ch_waveform[:int(analysis_config.run_parameters['Baseline Length [samples]'])]))
+			#different cases for tile/SiPM
+			try:
+				self.charge_energy_ch.append(entry_from_reduced['{} {} Charge Energy'.format(ch_type,ch_name)])
+				self.risetime.append(entry_from_reduced['{} {} T90'.format(ch_type,ch_name)]/self.sampling_frequency)
+			except (KeyError, UnboundLocalError, AttributeError):
+				self.charge_energy_ch.append(0)
+				self.risetime.append(0)
+
+
+	#smoothing function, the waveform is overwritten, time_width is in us
+	def smooth( self, time_width ):
+		for k,v in self.waveform.items():
+			self.waveform[k].data = gaussian_filter( v.data.astype(float), time_width*self.sampling_frequency)
+		return self.waveform
+
+
+	def plot_event( self, risetime=False ):
+		import matplotlib.pyplot as plt
+		ch_offset = 500
+		for i,e in enumerate(np.argsort(self.ix_channel)):
+			v = list(self.waveform.keys())[e]
+			p = plt.plot(np.arange(len(self.waveform[v].data))/self.sampling_frequency,self.waveform[v].data-self.baseline[e]+ch_offset*i,lw=1)
+			plt.text(0,ch_offset*i,'{} {:.1f}'.format(v,self.charge_energy_ch[e]))
+			if risetime and self.charge_energy_ch[e]>0:
+				plt.vlines(self.risetime[e],ch_offset*i,ch_offset*i+2*self.charge_energy_ch[e],linestyles='dashed',colors=p[0].get_color())
+
+		plt.xlabel('time [$\mu$s]')
+		plt.title('Event {}, Energy {:.1f} ADC counts'.format(self.event_number,self.tot_charge_energy))
+		plt.tight_layout()
+		return(plt)
+
+class Simulated_Event:
+
+	def __init__( self, reduced, path_to_tier1, event_number,\
+			run_parameters_file,\
+			calibrations_file,\
+			channel_map_file,\
+			add_noise=True):
+
+		from TMSAnalysis.StruckAnalysisConfiguration import StruckAnalysisConfiguration
+		from TMSAnalysis.ParseSimulation import NEXOOfflineFile
+		import pickle
+
+		try :
+			if path_to_tier1[-1] is not '/':
+				path_to_tier1 += '/'
+		except TypeError:
+			pass
+
+		analysis_config = StruckAnalysisConfiguration.StruckAnalysisConfiguration()
+		analysis_config.GetRunParametersFromFile( run_parameters_file, path_to_tier1.split('/')[-3] )
+		analysis_config.GetCalibrationConstantsFromFile( calibrations_file )
+		analysis_config.GetChannelMapFromFile( channel_map_file, path_to_tier1.split('/')[-3] )
+		channel_number = analysis_config.GetNumberOfChannels()
+		self.event_number 		= event_number
+		self.waveform 			= {}
+		self.baseline			= []
+		self.baseline_rms		= []
+		self.charge_energy_ch		= []
+		self.risetime 			= []
+		self.sampling_frequency = analysis_config.run_parameters['Simulation Sampling Rate [MHz]']
+
+		if path_to_tier1 is not None:
+			path_to_file 		= path_to_tier1
+			try:
+				entry_from_reduced 	= pd.read_hdf(reduced, start=self.event_number, stop=self.event_number+1)
+				timestamp 		= entry_from_reduced['Timestamp'].values[0]
+				fname 			= entry_from_reduced['File'].values[0]
+				self.tot_charge_energy 	= entry_from_reduced['TotalTileEnergy'].values[0]
+				self.event_number 	= entry_from_reduced['Event'][event_number]
+			except OSError:
+				entry_from_reduced = pd.read_pickle(reduced).iloc[self.event_number]
+				timestamp 		= entry_from_reduced['Timestamp']
+				fname 			= entry_from_reduced['File']
+				self.tot_charge_energy 	= entry_from_reduced['TotalTileEnergy']
+				self.event_number 	= entry_from_reduced['Event']
+
+		else:
+			print('No reduced file found, charge energy and risetime information not present')
+			fname = reduced.split('/')[-1]
+			path_to_file = reduced[:-len(fname)]
+			self.tot_charge_energy = 0.0
+
+		pickled_fname = path_to_file + 'channel_status.p'
+		global software_channel 
+		software_channel = analysis_config.channel_map['Board']*16+analysis_config.channel_map['InputChannel']
+		global ch_status
+		with open(pickled_fname,'rb') as f:
+			ch_status = pickle.load(f)
+
+		input_file = NEXOOfflineFile.NEXOOfflineFile( input_filename = path_to_file+fname,\
+								config = analysis_config,\
+								add_noise = add_noise,\
+								noise_lib_directory='/usr/workspace/wsa/nexo/jacopod/dedicated_noise_run/')
+
+		if path_to_tier1 is not None and add_noise:
+			input_file.global_noise_file_counter = entry_from_reduced['NoiseIndex'][0]
+			input_file.noise_file_event_counter  = entry_from_reduced['NoiseIndex'][1]
+		input_df = input_file.GroupEventsAndWriteToHDF5(save = False, start_stop=[self.event_number,self.event_number+1])
+		#since the timestamps are not filled in the simulated data there is no real handle to cross-checked the event is actually the same
+
+		waveform = input_df['Data'][0]
+		self.ix_channel = []
+		#looping through channels and fill the waveforms
+		for i,ch_waveform in enumerate(waveform):
+			ch_type = analysis_config.GetChannelTypeForSoftwareChannel(software_channel[i])
+			ch_name = analysis_config.GetChannelNameForSoftwareChannel(software_channel[i])
+			self.ix_channel.append(software_channel[i])
+
+			if ch_name in ch_status.keys():
+				mean,sigma = ch_status[ch_name]
+				ch_waveform = np.random.normal(mean,sigma,len(ch_waveform))
+
+			self.waveform[ch_name] = Waveform(input_data = ch_waveform,\
+							detector_type       = ch_type,\
+							sampling_period_ns  = 1.e3/self.sampling_frequency,\
+							input_baseline      = -1,\
+							polarity            = -1,\
+							fixed_trigger       = False,\
+							trigger_position    = analysis_config.run_parameters['Pretrigger Length [samples]'],\
+							decay_time_us       = analysis_config.GetDecayTimeForSoftwareChannel(software_channel[i]),\
+							calibration_constant = analysis_config.GetCalibrationConstantForSoftwareChannel(software_channel[i]))
+			#same as for Waveform class
+			self.baseline.append(np.mean(ch_waveform[:int(analysis_config.run_parameters['Baseline Length [samples]'])]))
+			#different cases for tile/SiPM
+			try:
+				self.charge_energy_ch.append(entry_from_reduced['{} {} Charge Energy'.format(ch_type,ch_name)])
+				self.baseline_rms.append(entry_from_reduced['{} {} Baseline RMS'.format(ch_type,ch_name)])
+				self.risetime.append(entry_from_reduced['{} {} T90'.format(ch_type,ch_name)]/self.sampling_frequency)
+			except (KeyError, UnboundLocalError):
+				self.charge_energy_ch.append(0)
+				self.baseline_rms.append(0)
+				self.risetime.append(0)
+
+
+	#smoothing function, the waveform is overwritten, time_width is in us
+	def smooth( self, time_width ):
+		for k,v in self.waveform.items():
+			self.waveform[k].data = gaussian_filter( v.data.astype(float), time_width*self.sampling_frequency)
+		return self.waveform
+
+
+	def plot_event( self, risetime=False ):
+		import matplotlib.pyplot as plt
+		ch_offset = 250
+		for i,e in enumerate(np.argsort(self.ix_channel)):
+			v = list(self.waveform.keys())[e]
+			p = plt.plot(np.arange(len(self.waveform[v].data))/self.sampling_frequency,self.waveform[v].data-self.baseline[e]+ch_offset*i)
+			plt.text(0,ch_offset*i,'{} {:.1f}'.format(v,self.charge_energy_ch[e]))
+			if risetime and self.charge_energy_ch[e]>0:
+				plt.vlines(self.risetime[e],ch_offset*i,ch_offset*i+2*self.charge_energy_ch[e],linestyles='dashed',colors=p[0].get_color())
+
+		plt.xlabel('time [$\mu$s]')
+		plt.title('Event {}, Energy {:.1f} ADC counts'.format(int(self.event_number),self.tot_charge_energy))
+		plt.tight_layout()
+		return(plt)
